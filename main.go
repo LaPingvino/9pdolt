@@ -105,7 +105,24 @@ func main() {
 }
 
 func buildFS(dolt *DoltFS, defaultStyle string) (*fs.FS, *fs.StaticDir) {
-	f, root := fs.NewFS("nobody", "nobody", 0555)
+	f, root := fs.NewFS("nobody", "nobody", 0555,
+		fs.WithCreateFile(func(fsys *fs.FS, parent fs.Dir, user, name string, perm uint32, mode uint8) (fs.File, error) {
+			if qd, ok := parent.(*SQLQueryDir); ok {
+				return qd.Create(name, perm)
+			}
+			return nil, fmt.Errorf("create not supported here")
+		}),
+		fs.WithRemoveFile(func(fsys *fs.FS, node fs.FSNode) error {
+			af, ok := node.(*ActionFile)
+			if !ok {
+				return fmt.Errorf("remove not supported")
+			}
+			if qd, ok := af.Parent().(*SQLQueryDir); ok {
+				return qd.Remove(af.Stat().Name)
+			}
+			return fmt.Errorf("remove not supported")
+		}),
+	)
 
 	root.AddChild(fs.NewDynamicFile(
 		f.NewStat("branches", "nobody", "nobody", 0444),
@@ -118,15 +135,23 @@ func buildFS(dolt *DoltFS, defaultStyle string) (*fs.FS, *fs.StaticDir) {
 		},
 	))
 
+	// Cache branch dirs so each branch has a stable ActionFile instance
+	// (sqlLast, commitLast etc. must persist across multiple opens).
+	var branchMu sync.Mutex
+	branchCache := map[string]fs.FSNode{}
 	root.AddChild(newDynDir(f, "db", func() map[string]fs.FSNode {
 		branches, err := dolt.branchNames()
 		if err != nil {
 			return nil
 		}
+		branchMu.Lock()
+		defer branchMu.Unlock()
 		children := make(map[string]fs.FSNode, len(branches))
 		for _, b := range branches {
-			branch := b
-			children[branch] = newBranchDir(f, dolt, branch, defaultStyle)
+			if _, ok := branchCache[b]; !ok {
+				branchCache[b] = newBranchDir(f, dolt, b, defaultStyle)
+			}
+			children[b] = branchCache[b]
 		}
 		return children
 	}))
@@ -156,27 +181,15 @@ func newBranchDir(f *fs.FS, dolt *DoltFS, branch, defaultStyle string) fs.FSNode
 		},
 	)
 
-	// sql: write SQL → execute; read → last result.
-	var sqlMu sync.Mutex
-	var sqlLast []byte
-	sqlFile := newActionFile(f, "sql", 0666,
-		func() []byte {
-			sqlMu.Lock()
-			defer sqlMu.Unlock()
-			return sqlLast
-		},
-		func(in []byte) {
-			query := strings.TrimRight(string(in), "\n\r ")
-			result, err := dolt.ExecSQL(branch, query)
-			sqlMu.Lock()
-			if err != nil {
-				sqlLast = errBytes(err)
-			} else {
-				sqlLast = result
-			}
-			sqlMu.Unlock()
-		},
-	)
+	// sql: a directory of named query slots.
+	// Write SQL to sql/myquery → executes; read → last result; rm → drop slot.
+	sqlDir := newSQLQueryDir(f, "sql", func(query string) []byte {
+		result, err := dolt.ExecSQL(branch, query)
+		if err != nil {
+			return errBytes(err)
+		}
+		return result
+	})
 
 	// commit: write message → DOLT_COMMIT; read → last hash.
 	var commitMu sync.Mutex
@@ -235,7 +248,7 @@ func newBranchDir(f *fs.FS, dolt *DoltFS, branch, defaultStyle string) fs.FSNode
 					return data
 				},
 			),
-			"sql":    sqlFile,
+			"sql":    sqlDir,
 			"commit": commitFile,
 			"style":  styleFile,
 			"tables": tablesDir,

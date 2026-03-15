@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path"
@@ -88,6 +89,26 @@ var _ fs.NodeGetattrer = (*p9Node)(nil)
 var _ fs.NodeLookuper = (*p9Node)(nil)
 var _ fs.NodeReaddirer = (*p9Node)(nil)
 var _ fs.NodeOpener = (*p9Node)(nil)
+var _ fs.NodeCreater = (*p9Node)(nil)
+var _ fs.NodeSetattrer = (*p9Node)(nil)
+
+// Setattr is a no-op — ActionFile buffers are always per-open, so truncation
+// is handled naturally when a new write session starts.
+func (n *p9Node) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	return n.Getattr(ctx, f, out)
+}
+
+// Create is called for open-with-O_CREAT on existing 9P files (e.g. shell ">").
+// We ignore creation flags and just open the file for writing.
+func (n *p9Node) Create(ctx context.Context, name string, flags uint32, perm uint32, out *fuse.EntryOut) (node *fs.Inode, fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
+	childPath := path.Join(n.p9path, name)
+	f, err := n.client.Open(childPath, proto.Owrite)
+	if err != nil {
+		return nil, nil, 0, syscall.EIO
+	}
+	child := n.NewInode(ctx, &p9Node{client: n.client, p9path: childPath}, fs.StableAttr{})
+	return child, &p9FileHandle{file: f}, fuse.FOPEN_DIRECT_IO, 0
+}
 
 func (n *p9Node) Getattr(ctx context.Context, _ fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
 	stat, err := n.client.Stat(n.p9path)
@@ -157,7 +178,7 @@ var _ fs.FileReleaser = (*p9FileHandle)(nil)
 
 func (h *p9FileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	n, err := h.file.ReadAt(dest, off)
-	if err != nil && n == 0 {
+	if err != nil && err != io.EOF && n == 0 {
 		return nil, syscall.EIO
 	}
 	return fuse.ReadResultData(dest[:n]), 0
