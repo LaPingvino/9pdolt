@@ -15,10 +15,30 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", "localhost:5640", "9P listen address")
+	addr := flag.String("addr", "localhost:5640", "9P listen address (TCP); ignored when -mount is set")
 	dsn := flag.String("dsn", "root@tcp(localhost:3306)/", "Dolt MySQL DSN (no database); ignored when -repo is set")
 	repo := flag.String("repo", "", "path to a Dolt repository; starts dolt sql-server automatically")
+	mount := flag.String("mount", "", "mountpoint: serve on a Unix socket and mount 9P there (requires root)")
 	flag.Parse()
+
+	// cleanups are run in reverse order on exit.
+	var cleanups []func()
+	defer func() {
+		for i := len(cleanups) - 1; i >= 0; i-- {
+			cleanups[i]()
+		}
+	}()
+
+	// Single signal handler that drains cleanups then exits.
+	go func() {
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
+		<-ch
+		for i := len(cleanups) - 1; i >= 0; i-- {
+			cleanups[i]()
+		}
+		os.Exit(0)
+	}()
 
 	if *repo != "" {
 		socketDSN, cleanup, err := startDoltServer(*repo)
@@ -26,17 +46,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "failed to start Dolt server: %v\n", err)
 			os.Exit(1)
 		}
-		defer cleanup()
-
-		// Also clean up on signal.
-		go func() {
-			ch := make(chan os.Signal, 1)
-			signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
-			<-ch
-			cleanup()
-			os.Exit(0)
-		}()
-
+		cleanups = append(cleanups, cleanup)
 		*dsn = socketDSN
 	}
 
@@ -46,6 +56,40 @@ func main() {
 		os.Exit(1)
 	}
 
+	f, _ := buildFS(dolt)
+
+	srv := f.Server()
+
+	if *mount != "" {
+		// Use a per-process temp socket for the 9P server.
+		sockPath := fmt.Sprintf("/tmp/9pdolt-%d.sock", os.Getpid())
+		cleanups = append(cleanups, func() { os.Remove(sockPath) })
+
+		go func() {
+			if err := serveUnix(sockPath, srv); err != nil {
+				log.Printf("9P server error: %v", err)
+			}
+		}()
+
+		// Give the listener a moment to create the socket file.
+		waitForSocket(sockPath, 0) // reuse existing helper, near-instant
+
+		if err := mountFS(sockPath, *mount); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to mount: %v\n", err)
+			os.Exit(1)
+		}
+		cleanups = append(cleanups, func() { unmountFS(*mount) })
+		log.Printf("9pdolt mounted at %s (socket %s)", *mount, sockPath)
+
+		// Block until signal (handled above).
+		select {}
+	}
+
+	log.Printf("9pdolt listening on %s", *addr)
+	log.Fatal(go9p.Serve(*addr, srv))
+}
+
+func buildFS(dolt *DoltFS) (*fs.FS, *fs.StaticDir) {
 	f, root := fs.NewFS("nobody", "nobody", 0555)
 
 	// Registry mapping sql DynDir → branch name for WalkFail to intercept.
@@ -62,7 +106,7 @@ func main() {
 			return nil, fmt.Errorf("bad query encoding %q: %w", name, err)
 		}
 		b := branch.(string)
-		file := fs.NewDynamicFile(
+		return fs.NewDynamicFile(
 			fsys.NewStat(name, "nobody", "nobody", 0444),
 			func() []byte {
 				data, err := dolt.Query(b, query)
@@ -71,11 +115,9 @@ func main() {
 				}
 				return data
 			},
-		)
-		return file, nil
+		), nil
 	}
 
-	// branches file at root.
 	root.AddChild(fs.NewDynamicFile(
 		f.NewStat("branches", "nobody", "nobody", 0444),
 		func() []byte {
@@ -87,8 +129,7 @@ func main() {
 		},
 	))
 
-	// db/ dir: each branch is a subdirectory.
-	dbDir := newDynDir(f, "db", func() map[string]fs.FSNode {
+	root.AddChild(newDynDir(f, "db", func() map[string]fs.FSNode {
 		branches, err := dolt.branchNames()
 		if err != nil {
 			return nil
@@ -99,11 +140,9 @@ func main() {
 			children[branch] = newBranchDir(f, dolt, branch, &sqlDirs)
 		}
 		return children
-	})
-	root.AddChild(dbDir)
+	}))
 
-	log.Printf("9pdolt listening on %s", *addr)
-	log.Fatal(go9p.Serve(*addr, f.Server()))
+	return f, root
 }
 
 func newBranchDir(f *fs.FS, dolt *DoltFS, branch string, sqlDirs *sync.Map) fs.FSNode {
@@ -120,7 +159,6 @@ func newBranchDir(f *fs.FS, dolt *DoltFS, branch string, sqlDirs *sync.Map) fs.F
 				},
 			),
 		}
-		// sql/ directory — WalkFail handles actual query files.
 		sqlDir := newDynDir(f, "sql", func() map[string]fs.FSNode {
 			return map[string]fs.FSNode{}
 		})

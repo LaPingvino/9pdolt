@@ -143,7 +143,7 @@ func (d *DoltFS) branchNames() ([]string, error) {
 // Query executes an arbitrary SELECT on the given branch and returns CSV.
 func (d *DoltFS) Query(branch, query string) ([]byte, error) {
 	// Switch to the branch database first via USE, then run the query.
-	conn, err := d.db.Conn(nil)
+	conn, err := d.db.Conn(context.Background())
 	if err != nil {
 		return nil, err
 	}

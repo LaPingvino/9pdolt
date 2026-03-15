@@ -4,28 +4,41 @@ Mounts a [Dolt](https://github.com/dolthub/dolt) database as a [9P](https://en.w
 
 ## Usage
 
-Start a Dolt SQL server first:
+### Automatic (recommended)
+
+Point `-repo` at a Dolt repository and `-mount` at an empty directory.
+9pdolt will start `dolt sql-server`, serve 9P on a temp Unix socket, and
+mount it — all in one step:
 
 ```sh
-dolt sql-server
+sudo 9pdolt -repo /path/to/my-dolt-repo -mount /mnt/dolt
 ```
 
-Then run 9pdolt:
+Press Ctrl-C (or send SIGTERM) to unmount, stop the server, and clean up.
+
+### Manual
+
+Start a Dolt SQL server separately, then run 9pdolt:
+
+```sh
+dolt sql-server                              # in your repo directory
+9pdolt -dsn "root@tcp(localhost:3306)/" -mount /mnt/dolt
+```
+
+Or just expose the 9P server on TCP without mounting:
 
 ```sh
 9pdolt -addr localhost:5640 -dsn "root@tcp(localhost:3306)/"
 ```
 
-Mount it (Linux example using `v9fs`):
+Then mount manually:
 
 ```sh
-mount -t 9p -o trans=tcp,port=5640,version=9p2000 localhost /mnt/dolt
-```
+# Linux (v9fs, requires root):
+mount -t 9p -o trans=tcp,port=5640,version=9p2000.L localhost /mnt/dolt
 
-Or on Plan 9 / with `9pfuse`:
-
-```sh
-9pfuse localhost:5640 /mnt/dolt
+# Plan 9 / plan9port:
+9pfuse tcp!localhost!5640 /mnt/dolt
 ```
 
 ## Filesystem layout
@@ -61,7 +74,9 @@ cat /mnt/dolt/db/main/sql/SELECT+*+FROM+users+LIMIT+5
 
 ## Flags
 
-| Flag    | Default                      | Description                              |
-|---------|------------------------------|------------------------------------------|
-| `-addr` | `localhost:5640`             | TCP address to listen on                 |
-| `-dsn`  | `root@tcp(localhost:3306)/`  | MySQL DSN for the Dolt server (no DB)    |
+| Flag     | Default                      | Description                                              |
+|----------|------------------------------|----------------------------------------------------------|
+| `-addr`  | `localhost:5640`             | TCP address to listen on (ignored when `-mount` is set)  |
+| `-dsn`   | `root@tcp(localhost:3306)/`  | MySQL DSN for the Dolt server (ignored when `-repo` set) |
+| `-repo`  |                              | Dolt repo path; auto-starts `dolt sql-server`            |
+| `-mount` |                              | Mountpoint; serves via Unix socket and mounts (needs root)|
