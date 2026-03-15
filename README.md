@@ -49,31 +49,75 @@ mount -t 9p -o trans=tcp,port=5640,version=9p2000.L localhost /mnt/dolt
 
 ```
 /
-├── branches          ← newline-separated list of branches (databases)
+├── branches               ← newline-separated list of branches
 └── db/
     └── <branch>/
-        ├── log           ← commit log (last 100 entries)
-        ├── sql/          ← arbitrary SELECT queries (see below)
-        └── <table>/
-            ├── schema    ← CREATE TABLE statement
-            └── data.csv  ← all rows as CSV
+        ├── log            ← commit log (last 100 entries)
+        ├── status         ← dolt_status (staged/unstaged changes)
+        ├── commit         ← write a message to commit; read back the hash
+        ├── sql            ← write SQL to execute; read back the result
+        ├── style          ← read/write: "csv", "json", or "file"
+        └── tables/
+            └── <table>/
+                ├── schema ← CREATE TABLE statement
+                └── ...    ← table data (format depends on style)
 ```
 
-## Arbitrary SQL queries
+## Table styles
 
-Files under `sql/` are named with URL-encoded SQL. Reading them executes the
-query and returns CSV:
+The `-style` flag (default `csv`) controls how table data appears.
+You can also change it live per branch by writing to the `style` file.
 
-```sh
-# cat "/mnt/dolt/db/main/sql/SELECT * FROM users LIMIT 5" does not work
-# because of spaces — use URL encoding:
-cat "/mnt/dolt/db/main/sql/SELECT%20*%20FROM%20users%20LIMIT%205"
+### csv (default)
+
+```
+tables/<table>/
+├── schema
+└── data.csv    ← all rows as CSV; writable (REPLACE INTO on write)
 ```
 
-With Plan 9 tools:
+### json
+
+```
+tables/<table>/
+├── schema
+├── 1.json      ← {"id":"1","name":"Alice"}
+└── 2.json
+```
+
+### file
+
+```
+tables/<table>/
+├── schema
+└── 42/         ← one directory per row, named by primary key
+    ├── id      ← contains "42\n"
+    ├── name
+    └── email
+```
+
+## Arbitrary SQL
+
+Write any SQL to the `sql` file; read it back to get the result as CSV
+(for SELECT) or `rows affected: N` (for DML):
 
 ```sh
-cat /mnt/dolt/db/main/sql/SELECT+*+FROM+users+LIMIT+5
+echo "SELECT * FROM users LIMIT 5" > /mnt/dolt/db/main/sql
+cat /mnt/dolt/db/main/sql
+```
+
+## Committing changes
+
+```sh
+echo "add new users" > /mnt/dolt/db/main/commit
+cat /mnt/dolt/db/main/commit   # → abcdef1234...
+```
+
+## Changing style at runtime
+
+```sh
+echo json > /mnt/dolt/db/main/style
+ls /mnt/dolt/db/main/tables/users/   # now shows .json files
 ```
 
 ## Flags
@@ -85,3 +129,4 @@ cat /mnt/dolt/db/main/sql/SELECT+*+FROM+users+LIMIT+5
 | `-repo`       |                              | Dolt repo path; auto-starts `dolt sql-server`                |
 | `-mount`      |                              | Mountpoint; kernel v9fs via Unix socket (needs root)         |
 | `-fusemount`  |                              | Mountpoint; FUSE bridge via Unix socket (no root needed)     |
+| `-style`      | `csv`                        | Table style: `csv`, `json`, or `file`                        |

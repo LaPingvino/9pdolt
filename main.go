@@ -15,17 +15,23 @@ import (
 	"github.com/knusbaum/go9p/fs"
 )
 
+const validStyles = "csv, json, file"
+
+func isValidStyle(s string) bool {
+	return s == "csv" || s == "json" || s == "file"
+}
+
 func main() {
 	addr := flag.String("addr", "localhost:5640", "9P listen address (TCP); ignored when -mount is set")
 	dsn := flag.String("dsn", "root@tcp(localhost:3306)/", "Dolt MySQL DSN (no database); ignored when -repo is set")
 	repo := flag.String("repo", "", "path to a Dolt repository; starts dolt sql-server automatically")
 	mount := flag.String("mount", "", "mountpoint: kernel v9fs via Unix socket (requires root)")
 	fusemount := flag.String("fusemount", "", "mountpoint: FUSE bridge (no root required)")
-	format := flag.String("format", "csv", "table format: csv (single file), json (rows as .json files), fs (rows as dirs with per-column files)")
+	style := flag.String("style", "csv", "table style: csv (single file), json (rows as .json files), file (rows as dirs with per-column files)")
 	flag.Parse()
 
-	if *format != "csv" && *format != "json" && *format != "fs" {
-		fmt.Fprintf(os.Stderr, "unknown format %q: must be csv, json, or fs\n", *format)
+	if !isValidStyle(*style) {
+		fmt.Fprintf(os.Stderr, "unknown style %q: must be one of %s\n", *style, validStyles)
 		os.Exit(1)
 	}
 
@@ -62,7 +68,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	f, _ := buildFS(dolt, *format)
+	f, _ := buildFS(dolt, *style)
 	srv := f.Server()
 
 	if *fusemount != "" {
@@ -98,7 +104,7 @@ func main() {
 	log.Fatal(go9p.Serve(*addr, srv))
 }
 
-func buildFS(dolt *DoltFS, format string) (*fs.FS, *fs.StaticDir) {
+func buildFS(dolt *DoltFS, defaultStyle string) (*fs.FS, *fs.StaticDir) {
 	f, root := fs.NewFS("nobody", "nobody", 0555)
 
 	root.AddChild(fs.NewDynamicFile(
@@ -120,7 +126,7 @@ func buildFS(dolt *DoltFS, format string) (*fs.FS, *fs.StaticDir) {
 		children := make(map[string]fs.FSNode, len(branches))
 		for _, b := range branches {
 			branch := b
-			children[branch] = newBranchDir(f, dolt, branch, format)
+			children[branch] = newBranchDir(f, dolt, branch, defaultStyle)
 		}
 		return children
 	}))
@@ -128,8 +134,29 @@ func buildFS(dolt *DoltFS, format string) (*fs.FS, *fs.StaticDir) {
 	return f, root
 }
 
-func newBranchDir(f *fs.FS, dolt *DoltFS, branch, format string) fs.FSNode {
-	// sql ActionFile: each open gets its own result; write executes SQL.
+func newBranchDir(f *fs.FS, dolt *DoltFS, branch, defaultStyle string) fs.FSNode {
+	// Per-branch mutable style, initialised from the global default.
+	var styleMu sync.Mutex
+	currentStyle := defaultStyle
+	getStyle := func() string {
+		styleMu.Lock()
+		defer styleMu.Unlock()
+		return currentStyle
+	}
+
+	styleFile := newActionFile(f, "style", 0666,
+		func() []byte { return []byte(getStyle() + "\n") },
+		func(in []byte) {
+			s := strings.TrimRight(string(in), "\n\r ")
+			if isValidStyle(s) {
+				styleMu.Lock()
+				currentStyle = s
+				styleMu.Unlock()
+			}
+		},
+	)
+
+	// sql: write SQL → execute; read → last result.
 	var sqlMu sync.Mutex
 	var sqlLast []byte
 	sqlFile := newActionFile(f, "sql", 0666,
@@ -151,7 +178,7 @@ func newBranchDir(f *fs.FS, dolt *DoltFS, branch, format string) fs.FSNode {
 		},
 	)
 
-	// commit ActionFile: write message → DOLT_COMMIT; read → last hash.
+	// commit: write message → DOLT_COMMIT; read → last hash.
 	var commitMu sync.Mutex
 	var commitLast []byte
 	commitFile := newActionFile(f, "commit", 0666,
@@ -173,8 +200,21 @@ func newBranchDir(f *fs.FS, dolt *DoltFS, branch, format string) fs.FSNode {
 		},
 	)
 
+	tablesDir := newDynDir(f, "tables", func() map[string]fs.FSNode {
+		tables, err := dolt.Tables(branch)
+		if err != nil {
+			return nil
+		}
+		children := make(map[string]fs.FSNode, len(tables))
+		for _, t := range tables {
+			table := t
+			children[table] = newTableDir(f, dolt, branch, table, getStyle())
+		}
+		return children
+	})
+
 	return newDynDir(f, branch, func() map[string]fs.FSNode {
-		children := map[string]fs.FSNode{
+		return map[string]fs.FSNode{
 			"log": fs.NewDynamicFile(
 				f.NewStat("log", "nobody", "nobody", 0444),
 				func() []byte {
@@ -197,21 +237,13 @@ func newBranchDir(f *fs.FS, dolt *DoltFS, branch, format string) fs.FSNode {
 			),
 			"sql":    sqlFile,
 			"commit": commitFile,
+			"style":  styleFile,
+			"tables": tablesDir,
 		}
-
-		tables, err := dolt.Tables(branch)
-		if err != nil {
-			return children
-		}
-		for _, t := range tables {
-			table := t
-			children[table] = newTableDir(f, dolt, branch, table, format)
-		}
-		return children
 	})
 }
 
-func newTableDir(f *fs.FS, dolt *DoltFS, branch, table, format string) fs.FSNode {
+func newTableDir(f *fs.FS, dolt *DoltFS, branch, table, style string) fs.FSNode {
 	schemaFile := fs.NewDynamicFile(
 		f.NewStat("schema", "nobody", "nobody", 0444),
 		func() []byte {
@@ -223,11 +255,11 @@ func newTableDir(f *fs.FS, dolt *DoltFS, branch, table, format string) fs.FSNode
 		},
 	)
 
-	switch format {
+	switch style {
 	case "json":
 		return newTableDirJSON(f, dolt, branch, table, schemaFile)
-	case "fs":
-		return newTableDirFS(f, dolt, branch, table, schemaFile)
+	case "file":
+		return newTableDirFile(f, dolt, branch, table, schemaFile)
 	default: // "csv"
 		dataFile := newActionFile(f, "data.csv", 0666,
 			func() []byte {
@@ -248,7 +280,7 @@ func newTableDir(f *fs.FS, dolt *DoltFS, branch, table, format string) fs.FSNode
 	}
 }
 
-// newTableDirJSON returns a table directory where each row is a <pk>.json file.
+// newTableDirJSON: each row is a <pk>.json file.
 func newTableDirJSON(f *fs.FS, dolt *DoltFS, branch, table string, schemaFile fs.FSNode) fs.FSNode {
 	return newDynDir(f, table, func() map[string]fs.FSNode {
 		rows, _, err := dolt.Rows(branch, table)
@@ -256,10 +288,9 @@ func newTableDirJSON(f *fs.FS, dolt *DoltFS, branch, table string, schemaFile fs
 			return map[string]fs.FSNode{"schema": schemaFile}
 		}
 		pks, _ := dolt.PrimaryKey(branch, table)
-
 		children := map[string]fs.FSNode{"schema": schemaFile}
 		for _, row := range rows {
-			row := row // capture
+			row := row
 			name := rowKey(row, pks) + ".json"
 			children[name] = fs.NewDynamicFile(
 				f.NewStat(name, "nobody", "nobody", 0444),
@@ -273,27 +304,24 @@ func newTableDirJSON(f *fs.FS, dolt *DoltFS, branch, table string, schemaFile fs
 	})
 }
 
-// newTableDirFS returns a table directory where each row is a subdirectory
-// named by primary key, containing one file per column.
-func newTableDirFS(f *fs.FS, dolt *DoltFS, branch, table string, schemaFile fs.FSNode) fs.FSNode {
+// newTableDirFile: each row is a subdirectory named by PK, with one file per column.
+func newTableDirFile(f *fs.FS, dolt *DoltFS, branch, table string, schemaFile fs.FSNode) fs.FSNode {
 	return newDynDir(f, table, func() map[string]fs.FSNode {
 		rows, cols, err := dolt.Rows(branch, table)
 		if err != nil {
 			return map[string]fs.FSNode{"schema": schemaFile}
 		}
 		pks, _ := dolt.PrimaryKey(branch, table)
-
 		children := map[string]fs.FSNode{"schema": schemaFile}
 		for _, row := range rows {
-			row := row // capture
+			row := row
 			dirName := rowKey(row, pks)
-			colFiles := map[string]fs.FSNode{}
+			colFiles := make(map[string]fs.FSNode, len(cols))
 			for _, col := range cols {
-				col := col // capture
-				val := []byte(row[col] + "\n")
+				col := col
 				colFiles[col] = fs.NewStaticFile(
 					f.NewStat(col, "nobody", "nobody", 0444),
-					val,
+					[]byte(row[col]+"\n"),
 				)
 			}
 			children[dirName] = newDynDir(f, dirName, func() map[string]fs.FSNode {
@@ -305,10 +333,8 @@ func newTableDirFS(f *fs.FS, dolt *DoltFS, branch, table string, schemaFile fs.F
 }
 
 // rowKey builds a filesystem-safe name from a row's primary key values.
-// Falls back to joining all values if no PKs are known.
 func rowKey(row map[string]string, pks []string) string {
 	if len(pks) == 0 {
-		// fallback: concatenate all values
 		var parts []string
 		for _, v := range row {
 			parts = append(parts, v)
