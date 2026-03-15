@@ -6,9 +6,13 @@ Mounts a [Dolt](https://github.com/dolthub/dolt) database as a [9P](https://en.w
 
 ### Automatic (recommended)
 
-Point `-repo` at a Dolt repository and `-mount` at an empty directory.
-9pdolt will start `dolt sql-server`, serve 9P on a temp Unix socket, and
-mount it — all in one step:
+**Without root** — uses FUSE:
+
+```sh
+9pdolt -repo /path/to/my-dolt-repo -fusemount ~/mnt/dolt
+```
+
+**With root** — uses the kernel v9fs driver:
 
 ```sh
 sudo 9pdolt -repo /path/to/my-dolt-repo -mount /mnt/dolt
@@ -74,9 +78,10 @@ cat /mnt/dolt/db/main/sql/SELECT+*+FROM+users+LIMIT+5
 
 ## Flags
 
-| Flag     | Default                      | Description                                              |
-|----------|------------------------------|----------------------------------------------------------|
-| `-addr`  | `localhost:5640`             | TCP address to listen on (ignored when `-mount` is set)  |
-| `-dsn`   | `root@tcp(localhost:3306)/`  | MySQL DSN for the Dolt server (ignored when `-repo` set) |
-| `-repo`  |                              | Dolt repo path; auto-starts `dolt sql-server`            |
-| `-mount` |                              | Mountpoint; serves via Unix socket and mounts (needs root)|
+| Flag          | Default                      | Description                                                  |
+|---------------|------------------------------|--------------------------------------------------------------|
+| `-addr`       | `localhost:5640`             | TCP address to listen on (ignored when `-mount` is set)      |
+| `-dsn`        | `root@tcp(localhost:3306)/`  | MySQL DSN for the Dolt server (ignored when `-repo` is set)  |
+| `-repo`       |                              | Dolt repo path; auto-starts `dolt sql-server`                |
+| `-mount`      |                              | Mountpoint; kernel v9fs via Unix socket (needs root)         |
+| `-fusemount`  |                              | Mountpoint; FUSE bridge via Unix socket (no root needed)     |

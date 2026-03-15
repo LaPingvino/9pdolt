@@ -19,6 +19,7 @@ func main() {
 	dsn := flag.String("dsn", "root@tcp(localhost:3306)/", "Dolt MySQL DSN (no database); ignored when -repo is set")
 	repo := flag.String("repo", "", "path to a Dolt repository; starts dolt sql-server automatically")
 	mount := flag.String("mount", "", "mountpoint: serve on a Unix socket and mount 9P there (requires root)")
+	fusemount := flag.String("fusemount", "", "mountpoint: mount via FUSE in userland (no root required)")
 	flag.Parse()
 
 	// cleanups are run in reverse order on exit.
@@ -59,6 +60,17 @@ func main() {
 	f, _ := buildFS(dolt)
 
 	srv := f.Server()
+
+	if *fusemount != "" {
+		cleanup, err := fuseMount(*fusemount, srv)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to FUSE mount: %v\n", err)
+			os.Exit(1)
+		}
+		cleanups = append(cleanups, cleanup)
+		log.Printf("9pdolt FUSE mounted at %s", *fusemount)
+		select {}
+	}
 
 	if *mount != "" {
 		// Use a per-process temp socket for the 9P server.
