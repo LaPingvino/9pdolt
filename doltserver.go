@@ -10,13 +10,34 @@ import (
 	"time"
 )
 
+// freePort returns a free TCP port on localhost by briefly binding to :0.
+func freePort() (int, error) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+	return port, nil
+}
+
 // startDoltServer starts "dolt sql-server" in repoDir, using a temp Unix
 // socket. It returns the DSN to use and a cleanup function that stops the
 // server and removes the socket file. The caller must call cleanup() when done.
 func startDoltServer(repoDir string) (dsn string, cleanup func(), err error) {
 	socketPath := filepath.Join(os.TempDir(), fmt.Sprintf("9pdolt-%d.sock", os.Getpid()))
 
-	cmd := exec.Command("dolt", "sql-server", "--socket", socketPath)
+	// Use a free ephemeral port so dolt's TCP listener doesn't land on 3306
+	// and conflict with any MySQL instance already running on the system.
+	port, err := freePort()
+	if err != nil {
+		return "", nil, fmt.Errorf("finding free port: %w", err)
+	}
+
+	cmd := exec.Command("dolt", "sql-server",
+		"--socket", socketPath,
+		"--port", fmt.Sprintf("%d", port),
+	)
 	cmd.Dir = repoDir
 	cmd.Stdout = os.Stderr // route dolt logs to stderr
 	cmd.Stderr = os.Stderr
