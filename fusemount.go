@@ -22,7 +22,6 @@ import (
 func fuseMount(mountpoint string, srv go9p.Srv) (cleanup func(), err error) {
 	sockPath := fmt.Sprintf("/tmp/9pdolt-fuse-%d.sock", os.Getpid())
 
-	// Start 9P server on Unix socket.
 	ln, err := net.Listen("unix", sockPath)
 	if err != nil {
 		return nil, fmt.Errorf("listen unix %s: %w", sockPath, err)
@@ -37,7 +36,6 @@ func fuseMount(mountpoint string, srv go9p.Srv) (cleanup func(), err error) {
 		}
 	}()
 
-	// Connect 9P client.
 	conn, err := net.DialTimeout("unix", sockPath, 5*time.Second)
 	if err != nil {
 		ln.Close()
@@ -79,7 +77,7 @@ func fuseMount(mountpoint string, srv go9p.Srv) (cleanup func(), err error) {
 	return cleanup, nil
 }
 
-// p9Node is a FUSE inode that proxies to a 9P path via c9p.
+// p9Node is a FUSE inode that proxies to a 9P path via the client.
 type p9Node struct {
 	fs.Inode
 	client *goclient.Client
@@ -112,8 +110,7 @@ func (n *p9Node) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (*
 	if stat.Mode&proto.DMDIR != 0 {
 		mode = fuse.S_IFDIR
 	}
-	inode := n.NewInode(ctx, child, fs.StableAttr{Mode: uint32(mode)})
-	return inode, 0
+	return n.NewInode(ctx, child, fs.StableAttr{Mode: uint32(mode)}), 0
 }
 
 func (n *p9Node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
@@ -127,31 +124,35 @@ func (n *p9Node) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 		if e.Mode&proto.DMDIR != 0 {
 			mode = syscall.S_IFDIR
 		}
-		dirEntries = append(dirEntries, fuse.DirEntry{
-			Name: e.Name,
-			Mode: mode,
-		})
+		dirEntries = append(dirEntries, fuse.DirEntry{Name: e.Name, Mode: mode})
 	}
 	return fs.NewListDirStream(dirEntries), 0
 }
 
 func (n *p9Node) Open(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
-	f, err := n.client.Open(n.p9path, proto.Oread)
+	var p9mode proto.Mode
+	switch flags & syscall.O_ACCMODE {
+	case syscall.O_WRONLY:
+		p9mode = proto.Owrite
+	case syscall.O_RDWR:
+		p9mode = proto.Ordwr
+	default:
+		p9mode = proto.Oread
+	}
+	f, err := n.client.Open(n.p9path, p9mode)
 	if err != nil {
 		return nil, 0, syscall.EIO
 	}
 	return &p9FileHandle{file: f}, fuse.FOPEN_DIRECT_IO, 0
 }
 
-// p9FileHandle holds an open 9P file and implements FileReader.
+// p9FileHandle proxies reads and writes through a 9P client File.
 type p9FileHandle struct {
-	file interface {
-		ReadAt([]byte, int64) (int, error)
-		Close() error
-	}
+	file *goclient.File
 }
 
 var _ fs.FileReader = (*p9FileHandle)(nil)
+var _ fs.FileWriter = (*p9FileHandle)(nil)
 var _ fs.FileReleaser = (*p9FileHandle)(nil)
 
 func (h *p9FileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
@@ -160,6 +161,14 @@ func (h *p9FileHandle) Read(ctx context.Context, dest []byte, off int64) (fuse.R
 		return nil, syscall.EIO
 	}
 	return fuse.ReadResultData(dest[:n]), 0
+}
+
+func (h *p9FileHandle) Write(ctx context.Context, data []byte, off int64) (uint32, syscall.Errno) {
+	n, err := h.file.WriteAt(data, off)
+	if err != nil {
+		return 0, syscall.EIO
+	}
+	return uint32(n), 0
 }
 
 func (h *p9FileHandle) Release(ctx context.Context) syscall.Errno {

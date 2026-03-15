@@ -1,12 +1,13 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
-	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -18,19 +19,23 @@ func main() {
 	addr := flag.String("addr", "localhost:5640", "9P listen address (TCP); ignored when -mount is set")
 	dsn := flag.String("dsn", "root@tcp(localhost:3306)/", "Dolt MySQL DSN (no database); ignored when -repo is set")
 	repo := flag.String("repo", "", "path to a Dolt repository; starts dolt sql-server automatically")
-	mount := flag.String("mount", "", "mountpoint: serve on a Unix socket and mount 9P there (requires root)")
-	fusemount := flag.String("fusemount", "", "mountpoint: mount via FUSE in userland (no root required)")
+	mount := flag.String("mount", "", "mountpoint: kernel v9fs via Unix socket (requires root)")
+	fusemount := flag.String("fusemount", "", "mountpoint: FUSE bridge (no root required)")
+	format := flag.String("format", "csv", "table format: csv (single file), json (rows as .json files), fs (rows as dirs with per-column files)")
 	flag.Parse()
 
-	// cleanups are run in reverse order on exit.
+	if *format != "csv" && *format != "json" && *format != "fs" {
+		fmt.Fprintf(os.Stderr, "unknown format %q: must be csv, json, or fs\n", *format)
+		os.Exit(1)
+	}
+
+	// cleanups run in reverse order on exit.
 	var cleanups []func()
 	defer func() {
 		for i := len(cleanups) - 1; i >= 0; i-- {
 			cleanups[i]()
 		}
 	}()
-
-	// Single signal handler that drains cleanups then exits.
 	go func() {
 		ch := make(chan os.Signal, 1)
 		signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
@@ -57,8 +62,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	f, _ := buildFS(dolt)
-
+	f, _ := buildFS(dolt, *format)
 	srv := f.Server()
 
 	if *fusemount != "" {
@@ -73,27 +77,20 @@ func main() {
 	}
 
 	if *mount != "" {
-		// Use a per-process temp socket for the 9P server.
 		sockPath := fmt.Sprintf("/tmp/9pdolt-%d.sock", os.Getpid())
 		cleanups = append(cleanups, func() { os.Remove(sockPath) })
-
 		go func() {
 			if err := serveUnix(sockPath, srv); err != nil {
 				log.Printf("9P server error: %v", err)
 			}
 		}()
-
-		// Give the listener a moment to create the socket file.
-		waitForSocket(sockPath, 0) // reuse existing helper, near-instant
-
+		waitForSocket(sockPath, 0)
 		if err := mountFS(sockPath, *mount); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to mount: %v\n", err)
 			os.Exit(1)
 		}
 		cleanups = append(cleanups, func() { unmountFS(*mount) })
 		log.Printf("9pdolt mounted at %s (socket %s)", *mount, sockPath)
-
-		// Block until signal (handled above).
 		select {}
 	}
 
@@ -101,41 +98,15 @@ func main() {
 	log.Fatal(go9p.Serve(*addr, srv))
 }
 
-func buildFS(dolt *DoltFS) (*fs.FS, *fs.StaticDir) {
+func buildFS(dolt *DoltFS, format string) (*fs.FS, *fs.StaticDir) {
 	f, root := fs.NewFS("nobody", "nobody", 0555)
-
-	// Registry mapping sql DynDir → branch name for WalkFail to intercept.
-	var sqlDirs sync.Map
-
-	// WalkFail: intercept walks into sql dirs to create on-the-fly query files.
-	f.WalkFail = func(fsys *fs.FS, parent fs.Dir, name string) (fs.FSNode, error) {
-		branch, ok := sqlDirs.Load(parent)
-		if !ok {
-			return nil, fmt.Errorf("%s: not found", name)
-		}
-		query, err := url.QueryUnescape(name)
-		if err != nil {
-			return nil, fmt.Errorf("bad query encoding %q: %w", name, err)
-		}
-		b := branch.(string)
-		return fs.NewDynamicFile(
-			fsys.NewStat(name, "nobody", "nobody", 0444),
-			func() []byte {
-				data, err := dolt.Query(b, query)
-				if err != nil {
-					return []byte("error: " + err.Error() + "\n")
-				}
-				return data
-			},
-		), nil
-	}
 
 	root.AddChild(fs.NewDynamicFile(
 		f.NewStat("branches", "nobody", "nobody", 0444),
 		func() []byte {
 			data, err := dolt.Branches()
 			if err != nil {
-				return []byte("error: " + err.Error() + "\n")
+				return errBytes(err)
 			}
 			return data
 		},
@@ -149,7 +120,7 @@ func buildFS(dolt *DoltFS) (*fs.FS, *fs.StaticDir) {
 		children := make(map[string]fs.FSNode, len(branches))
 		for _, b := range branches {
 			branch := b
-			children[branch] = newBranchDir(f, dolt, branch, &sqlDirs)
+			children[branch] = newBranchDir(f, dolt, branch, format)
 		}
 		return children
 	}))
@@ -157,7 +128,51 @@ func buildFS(dolt *DoltFS) (*fs.FS, *fs.StaticDir) {
 	return f, root
 }
 
-func newBranchDir(f *fs.FS, dolt *DoltFS, branch string, sqlDirs *sync.Map) fs.FSNode {
+func newBranchDir(f *fs.FS, dolt *DoltFS, branch, format string) fs.FSNode {
+	// sql ActionFile: each open gets its own result; write executes SQL.
+	var sqlMu sync.Mutex
+	var sqlLast []byte
+	sqlFile := newActionFile(f, "sql", 0666,
+		func() []byte {
+			sqlMu.Lock()
+			defer sqlMu.Unlock()
+			return sqlLast
+		},
+		func(in []byte) {
+			query := strings.TrimRight(string(in), "\n\r ")
+			result, err := dolt.ExecSQL(branch, query)
+			sqlMu.Lock()
+			if err != nil {
+				sqlLast = errBytes(err)
+			} else {
+				sqlLast = result
+			}
+			sqlMu.Unlock()
+		},
+	)
+
+	// commit ActionFile: write message → DOLT_COMMIT; read → last hash.
+	var commitMu sync.Mutex
+	var commitLast []byte
+	commitFile := newActionFile(f, "commit", 0666,
+		func() []byte {
+			commitMu.Lock()
+			defer commitMu.Unlock()
+			return commitLast
+		},
+		func(in []byte) {
+			msg := strings.TrimRight(string(in), "\n\r ")
+			result, err := dolt.Commit(branch, msg)
+			commitMu.Lock()
+			if err != nil {
+				commitLast = errBytes(err)
+			} else {
+				commitLast = result
+			}
+			commitMu.Unlock()
+		},
+	)
+
 	return newDynDir(f, branch, func() map[string]fs.FSNode {
 		children := map[string]fs.FSNode{
 			"log": fs.NewDynamicFile(
@@ -165,17 +180,24 @@ func newBranchDir(f *fs.FS, dolt *DoltFS, branch string, sqlDirs *sync.Map) fs.F
 				func() []byte {
 					data, err := dolt.Log(branch)
 					if err != nil {
-						return []byte("error: " + err.Error() + "\n")
+						return errBytes(err)
 					}
 					return data
 				},
 			),
+			"status": fs.NewDynamicFile(
+				f.NewStat("status", "nobody", "nobody", 0444),
+				func() []byte {
+					data, err := dolt.Status(branch)
+					if err != nil {
+						return errBytes(err)
+					}
+					return data
+				},
+			),
+			"sql":    sqlFile,
+			"commit": commitFile,
 		}
-		sqlDir := newDynDir(f, "sql", func() map[string]fs.FSNode {
-			return map[string]fs.FSNode{}
-		})
-		sqlDirs.Store(sqlDir, branch)
-		children["sql"] = sqlDir
 
 		tables, err := dolt.Tables(branch)
 		if err != nil {
@@ -183,35 +205,131 @@ func newBranchDir(f *fs.FS, dolt *DoltFS, branch string, sqlDirs *sync.Map) fs.F
 		}
 		for _, t := range tables {
 			table := t
-			children[table] = newTableDir(f, dolt, branch, table)
+			children[table] = newTableDir(f, dolt, branch, table, format)
 		}
 		return children
 	})
 }
 
-func newTableDir(f *fs.FS, dolt *DoltFS, branch, table string) fs.FSNode {
+func newTableDir(f *fs.FS, dolt *DoltFS, branch, table, format string) fs.FSNode {
+	schemaFile := fs.NewDynamicFile(
+		f.NewStat("schema", "nobody", "nobody", 0444),
+		func() []byte {
+			data, err := dolt.Schema(branch, table)
+			if err != nil {
+				return errBytes(err)
+			}
+			return data
+		},
+	)
+
+	switch format {
+	case "json":
+		return newTableDirJSON(f, dolt, branch, table, schemaFile)
+	case "fs":
+		return newTableDirFS(f, dolt, branch, table, schemaFile)
+	default: // "csv"
+		dataFile := newActionFile(f, "data.csv", 0666,
+			func() []byte {
+				data, err := dolt.Data(branch, table)
+				if err != nil {
+					return errBytes(err)
+				}
+				return data
+			},
+			func(in []byte) { _ = dolt.ReplaceCSV(branch, table, in) },
+		)
+		return newDynDir(f, table, func() map[string]fs.FSNode {
+			return map[string]fs.FSNode{
+				"schema":   schemaFile,
+				"data.csv": dataFile,
+			}
+		})
+	}
+}
+
+// newTableDirJSON returns a table directory where each row is a <pk>.json file.
+func newTableDirJSON(f *fs.FS, dolt *DoltFS, branch, table string, schemaFile fs.FSNode) fs.FSNode {
 	return newDynDir(f, table, func() map[string]fs.FSNode {
-		return map[string]fs.FSNode{
-			"schema": fs.NewDynamicFile(
-				f.NewStat("schema", "nobody", "nobody", 0444),
-				func() []byte {
-					data, err := dolt.Schema(branch, table)
-					if err != nil {
-						return []byte("error: " + err.Error() + "\n")
-					}
-					return data
-				},
-			),
-			"data.csv": fs.NewDynamicFile(
-				f.NewStat("data.csv", "nobody", "nobody", 0444),
-				func() []byte {
-					data, err := dolt.Data(branch, table)
-					if err != nil {
-						return []byte("error: " + err.Error() + "\n")
-					}
-					return data
-				},
-			),
+		rows, _, err := dolt.Rows(branch, table)
+		if err != nil {
+			return map[string]fs.FSNode{"schema": schemaFile}
 		}
+		pks, _ := dolt.PrimaryKey(branch, table)
+
+		children := map[string]fs.FSNode{"schema": schemaFile}
+		for _, row := range rows {
+			row := row // capture
+			name := rowKey(row, pks) + ".json"
+			children[name] = fs.NewDynamicFile(
+				f.NewStat(name, "nobody", "nobody", 0444),
+				func() []byte {
+					b, _ := jsonMarshalRow(row)
+					return b
+				},
+			)
+		}
+		return children
 	})
+}
+
+// newTableDirFS returns a table directory where each row is a subdirectory
+// named by primary key, containing one file per column.
+func newTableDirFS(f *fs.FS, dolt *DoltFS, branch, table string, schemaFile fs.FSNode) fs.FSNode {
+	return newDynDir(f, table, func() map[string]fs.FSNode {
+		rows, cols, err := dolt.Rows(branch, table)
+		if err != nil {
+			return map[string]fs.FSNode{"schema": schemaFile}
+		}
+		pks, _ := dolt.PrimaryKey(branch, table)
+
+		children := map[string]fs.FSNode{"schema": schemaFile}
+		for _, row := range rows {
+			row := row // capture
+			dirName := rowKey(row, pks)
+			colFiles := map[string]fs.FSNode{}
+			for _, col := range cols {
+				col := col // capture
+				val := []byte(row[col] + "\n")
+				colFiles[col] = fs.NewStaticFile(
+					f.NewStat(col, "nobody", "nobody", 0444),
+					val,
+				)
+			}
+			children[dirName] = newDynDir(f, dirName, func() map[string]fs.FSNode {
+				return colFiles
+			})
+		}
+		return children
+	})
+}
+
+// rowKey builds a filesystem-safe name from a row's primary key values.
+// Falls back to joining all values if no PKs are known.
+func rowKey(row map[string]string, pks []string) string {
+	if len(pks) == 0 {
+		// fallback: concatenate all values
+		var parts []string
+		for _, v := range row {
+			parts = append(parts, v)
+		}
+		return strings.Join(parts, "_")
+	}
+	parts := make([]string, len(pks))
+	for i, pk := range pks {
+		parts[i] = strings.ReplaceAll(row[pk], "/", "_")
+	}
+	return strings.Join(parts, "_")
+}
+
+func jsonMarshalRow(row map[string]string) ([]byte, error) {
+	b, err := json.Marshal(row)
+	if err != nil {
+		return nil, err
+	}
+	return append(b, '\n'), nil
+}
+
+func errBytes(err error) []byte {
+	return []byte("error: " + err.Error() + "\n")
 }
