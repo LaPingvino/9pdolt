@@ -6,7 +6,9 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 
 	"github.com/knusbaum/go9p"
 	"github.com/knusbaum/go9p/fs"
@@ -14,8 +16,29 @@ import (
 
 func main() {
 	addr := flag.String("addr", "localhost:5640", "9P listen address")
-	dsn := flag.String("dsn", "root@tcp(localhost:3306)/", "Dolt MySQL DSN (no database)")
+	dsn := flag.String("dsn", "root@tcp(localhost:3306)/", "Dolt MySQL DSN (no database); ignored when -repo is set")
+	repo := flag.String("repo", "", "path to a Dolt repository; starts dolt sql-server automatically")
 	flag.Parse()
+
+	if *repo != "" {
+		socketDSN, cleanup, err := startDoltServer(*repo)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to start Dolt server: %v\n", err)
+			os.Exit(1)
+		}
+		defer cleanup()
+
+		// Also clean up on signal.
+		go func() {
+			ch := make(chan os.Signal, 1)
+			signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
+			<-ch
+			cleanup()
+			os.Exit(0)
+		}()
+
+		*dsn = socketDSN
+	}
 
 	dolt, err := NewDoltFS(*dsn)
 	if err != nil {
