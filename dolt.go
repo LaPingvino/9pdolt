@@ -397,15 +397,27 @@ func (d *DoltFS) Rows(branch, table string) ([]map[string]string, []string, erro
 		}
 		row := make(map[string]string, len(cols))
 		for i, v := range vals {
-			if v == nil {
-				row[cols[i]] = ""
-			} else {
-				row[cols[i]] = fmt.Sprintf("%v", v)
-			}
+			row[cols[i]] = sqlValToString(v)
 		}
 		result = append(result, row)
 	}
 	return result, cols, nil
+}
+
+// sqlValToString converts a value scanned from database/sql into a string.
+// The MySQL driver returns text/blob columns as []byte, not string.
+func sqlValToString(v interface{}) string {
+	if v == nil {
+		return ""
+	}
+	switch s := v.(type) {
+	case []byte:
+		return string(s)
+	case string:
+		return s
+	default:
+		return fmt.Sprintf("%v", s)
+	}
 }
 
 // rowsToCSV serialises sql.Rows as CSV bytes.
@@ -428,11 +440,7 @@ func rowsToCSV(rows *sql.Rows) ([]byte, error) {
 		}
 		record := make([]string, len(cols))
 		for i, v := range vals {
-			if v == nil {
-				record[i] = ""
-			} else {
-				record[i] = fmt.Sprintf("%v", v)
-			}
+			record[i] = sqlValToString(v)
 		}
 		_ = w.Write(record)
 	}
