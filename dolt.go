@@ -115,11 +115,7 @@ func (d *DoltFS) Data(branch, table string) ([]byte, error) {
 		}
 		record := make([]string, len(cols))
 		for i, v := range vals {
-			if v == nil {
-				record[i] = ""
-			} else {
-				record[i] = fmt.Sprintf("%v", v)
-			}
+			record[i] = sqlValToString(v)
 		}
 		_ = w.Write(record)
 	}
